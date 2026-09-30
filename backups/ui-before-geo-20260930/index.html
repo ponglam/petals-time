@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Petals / time</title>
+<script>
+/* Version router. Every released renderer lives, frozen, in versions/<version>/.
+   A link carries its renderer version (#...&v=0.5.0), so old identities open in the renderer that made them.
+   To release a new version: copy the newest folder, edit the copy, add it to VERSIONS, update LATEST. */
+const VERSIONS = ["0.4.0", "0.5.0", "0.6.0"], LATEST = "0.6.0";
+(function () {
+  let v = LATEST;
+  try { const h = new URLSearchParams(location.hash.slice(1)); if (VERSIONS.includes(h.get("v"))) v = h.get("v"); } catch (e) {}
+  location.replace("versions/" + v + "/index.html" + location.hash);
+})();
+</script>
+<style>body{font-family:Georgia,serif;margin:3em;line-height:1.6;color:#2a2630;background:#eceaee}a{color:inherit}</style>
+</head>
+<body>
+<p>Opening the latest renderer. If nothing happens, choose a version:</p>
+<ul>
+  <li><a href="versions/0.6.0/index.html">0.6.0</a>, birthday and birth time form the seed</li>
+  <li><a href="versions/0.5.0/index.html">0.5.0</a>, gladiolus family and family selector</li>
+  <li><a href="versions/0.4.0/index.html">0.4.0</a>, first WebGL2 renderer</li>
+</ul>
+</body>
+</html>

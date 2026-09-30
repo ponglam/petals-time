@@ -1,0 +1,537 @@
+
+"use strict";
+/* ============================================================
+   PETALS / TIME — renderer 0.4.0
+   Seed = identity, age = transformation, samples = memory.
+   ============================================================ */
+const RENDERER_VERSION = "0.6.0";
+const NOW_DAY = 7301, MAX_DAY = 14601, ASPECT = 0.75, RES_W = 900, RES_H = 1200;
+
+/* ---------- deterministic randomness ---------- */
+function cyrb128(str){let h1=1779033703,h2=3144134277,h3=1013904242,h4=2773480762;
+  for(let i=0,k;i<str.length;i++){k=str.charCodeAt(i);h1=h2^Math.imul(h1^k,597399067);h2=h3^Math.imul(h2^k,2869860233);h3=h4^Math.imul(h3^k,951274213);h4=h1^Math.imul(h4^k,2716044179);}
+  h1=Math.imul(h3^(h1>>>18),597399067);h2=Math.imul(h4^(h2>>>22),2869860233);h3=Math.imul(h1^(h3>>>17),951274213);h4=Math.imul(h2^(h4>>>19),2716044179);
+  h1^=(h2^h3^h4);h2^=h1;h3^=h1;h4^=h1;return[h1>>>0,h2>>>0,h3>>>0,h4>>>0];}
+function sfc32(a,b,c,d){return function(){a|=0;b|=0;c|=0;d|=0;const t=(a+b|0)+d|0;d=d+1|0;a=b^b>>>9;b=c+(c<<3)|0;c=(c<<21|c>>>11);c=c+t|0;return(t>>>0)/4294967296;};}
+function makeRng(str){const r=sfc32(...cyrb128(str));for(let i=0;i<15;i++)r();
+  const R=()=>r(); R.range=(a,b)=>a+(b-a)*r(); R.int=(a,b)=>Math.floor(a+(b-a+1)*r()); R.sign=()=>r()<.5?-1:1; return R;}
+
+/* ---------- birth code: one unique seed per minute, 1900–2100 ----------
+   minutes since 1900-01-01 (floating civil time) -> bijective 30-bit scramble -> 6 Crockford base32 chars, prefixed "B".
+   Every minute gets its own seed, no two minutes share one, and the seed can be read back to its birthday. */
+const B32="0123456789ABCDEFGHJKMNPQRSTVWXYZ", MASK30=0x3FFFFFFF, BEPOCH=Date.UTC(1900,0,1);
+const MA=(0x2545F491&MASK30)|1, MB=(0x1B873593&MASK30)|1;
+function inv30(a){const m=1n<<30n,x=BigInt(a);let y=1n;for(let i=0;i<7;i++)y=((y*(2n-x*y))%m+m)%m;return Number(y);}
+const IA=inv30(MA), IB=inv30(MB);
+const unxs=(y,sh)=>{let x=y;for(let i=0;i<4;i++)x=y^(x>>>sh);return x&MASK30;};
+const perm30=x=>{x=Math.imul(x,MA)&MASK30;x^=x>>>13;x=Math.imul(x,MB)&MASK30;x^=x>>>11;return x&MASK30;};
+const unperm30=y=>{y=unxs(y,11);y=Math.imul(y,IB)&MASK30;y=unxs(y,13);y=Math.imul(y,IA)&MASK30;return y;};
+function birthToSeed(b){const m=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(b||"");if(!m)return null;
+  const mins=(Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5])-BEPOCH)/60000;if(!(mins>=0&&mins<=MASK30))return null;
+  let x=perm30(mins),out="";for(let i=0;i<6;i++){out=B32[x&31]+out;x>>>=5;}return"B"+out;}
+function seedToBirth(sd){if(!/^B[0-9A-HJKMNP-TV-Z]{6}$/.test(sd||""))return null;let x=0;for(const c of sd.slice(1))x=x*32+B32.indexOf(c);
+  const d=new Date(BEPOCH+unperm30(x)*60000);if(d.getUTCFullYear()>2100)return null;return d.toISOString().slice(0,16);}
+
+/* ---------- small math ---------- */
+const lerp=(a,b,t)=>a+(b-a)*t, clamp=(x,a,b)=>Math.min(b,Math.max(a,x)), clamp01=x=>clamp(x,0,1);
+const smooth=(a,b,x)=>{const t=clamp01((x-a)/(b-a));return t*t*(3-2*t);};
+const hex=h=>[parseInt(h.slice(1,3),16)/255,parseInt(h.slice(3,5),16)/255,parseInt(h.slice(5,7),16)/255];
+const mixc=(a,b,t)=>[lerp(a[0],b[0],t),lerp(a[1],b[1],t),lerp(a[2],b[2],t)];
+const toHex=c=>"#"+c.map(v=>Math.round(clamp01(v)*255).toString(16).padStart(2,"0")).join("");
+function hueRot(c,deg){const a=deg*Math.PI/180,cs=Math.cos(a),sn=Math.sin(a);
+  const y=.299*c[0]+.587*c[1]+.114*c[2],i=.596*c[0]-.274*c[1]-.322*c[2],q=.211*c[0]-.523*c[1]+.312*c[2];
+  const i2=i*cs-q*sn,q2=i*sn+q*cs;return[clamp01(y+.956*i2+.621*q2),clamp01(y-.272*i2-.647*q2),clamp01(y-1.106*i2+1.703*q2)];}
+const lum=c=>.2126*c[0]+.7152*c[1]+.0722*c[2];
+
+/* ---------- style space: six regions of one parameter space ---------- */
+const ARCH_DEF={stripe:0,silk:0,rf:5.5,edgePale:.2,spike:0,bottom:0,bloom:.55};
+const ARCH=[
+ {name:"floating / diffused", fibre:.6,vein:.06,dissolve:.45,ink:0,chroma:.12,smear:.95,blur:.5,macro:1,fMin:1,fMax:2,pMin:4,pMax:6,spread:2.5,width:.78,sa:.32,sb:.26,ruffle:.4,bend:.1,core:1,bract:0,stemW:.55,dens:.6,memory:.75,droop:0,stack:.8,cluster:.15},
+ {name:"vein ghost", fibre:.1,vein:.95,dissolve:.3,ink:.04,chroma:.06,smear:.62,blur:.45,macro:.45,fMin:3,fMax:4,pMin:3,pMax:3,spread:1.9,width:.36,sa:.55,sb:.85,ruffle:.05,bend:.1,core:0,bract:1,stemW:.6,dens:.72,memory:.8,droop:0,stack:.1,cluster:.8},
+ {name:"gladiolus bloom", fibre:.03,vein:0,dissolve:.16,ink:0,chroma:.06,smear:.5,blur:.26,macro:.8,fMin:4,fMax:5,pMin:4,pMax:6,spread:2.8,width:.32,sa:.55,sb:.38,ruffle:.5,bend:.4,core:0,bract:0,stemW:1.4,dens:.8,memory:.5,droop:.05,stack:0,cluster:0,
+   stripe:.5,silk:.85,rf:8,edgePale:.35,spike:1,bottom:.8,bloom:.8},
+ {name:"dissolved botanical", fibre:.02,vein:0,dissolve:.95,ink:.95,chroma:.04,smear:.6,blur:.8,macro:.8,fMin:2,fMax:3,pMin:3,pMax:4,spread:1.5,width:.6,sa:.7,sb:.5,ruffle:.25,bend:.1,core:0,bract:0,stemW:1.4,dens:.8,memory:.5,droop:.9,stack:.2,cluster:.4},
+ {name:"fibre flower", fibre:1,vein:.12,dissolve:.08,ink:0,chroma:.1,smear:.1,blur:.12,macro:.95,fMin:1,fMax:1,pMin:5,pMax:7,spread:4.1,width:.5,sa:.5,sb:.45,ruffle:.22,bend:.22,core:0,bract:0,stemW:.65,dens:.5,memory:.35,droop:0,stack:0,cluster:0},
+ {name:"spectral flower", fibre:.45,vein:.45,dissolve:.3,ink:0,chroma:.95,smear:.8,blur:.35,macro:.72,fMin:2,fMax:3,pMin:4,pMax:6,spread:3.4,width:.55,sa:.42,sb:.32,ruffle:.3,bend:.16,core:1,bract:0,stemW:.9,dens:.7,memory:.75,droop:0,stack:.4,cluster:.35},
+];
+
+const PAL=[
+ {bgA:"#cfdad6",bgB:"#dccbd4",root:"#ffb21a",mid:"#ff7446",tip:"#ffc1ae",accent:"#ff2f6d",stem:"#f2a38d",glow:"#fff0dc",dir:[0,1]},
+ {bgA:"#9fd6db",bgB:"#c4e6e5",root:"#ffa27e",mid:"#ee3f78",tip:"#ffa6c6",accent:"#d4163f",stem:"#c9b2a3",glow:"#ffe4d8",dir:[.2,1]},
+ {bgA:"#34adb4",bgB:"#a391d8",root:"#ff9a2e",mid:"#ff2a92",tip:"#ffc4da",accent:"#c4005c",stem:"#2f9784",glow:"#ffe8f0",dir:[-1,-.12]},
+ {bgA:"#f4f2da",bgB:"#d2d9a6",root:"#110d3e",mid:"#2d3bbb",tip:"#bda8d8",accent:"#0f0a26",stem:"#3a45ad",glow:"#fbf6e8",dir:[.3,-1]},
+ {bgA:"#e8eaf2",bgB:"#f2e2da",root:"#f08b4b",mid:"#e98aaa",tip:"#c8b1e2",accent:"#78c3ec",stem:"#7eb5d6",glow:"#fff6ea",dir:[1,-.3]},
+ {bgA:"#c28ab6",bgB:"#caa3c6",root:"#ffd11c",mid:"#ff5a2a",tip:"#fff1f0",accent:"#1f8fff",stem:"#3aa1e2",glow:"#fff5ec",dir:[0,1]},
+];
+ARCH.forEach(a=>{for(const k in ARCH_DEF) if(!(k in a)) a[k]=ARCH_DEF[k];});
+const FAMILIES=[["Mixed, the seed decides",-1],["Gladiolus bloom",2],["Floating poppy",0],["Veined bracts",1],["Ink tulip",3],["Fibre x-ray",4],["Spectral iris",5]];
+const TINT={cyan:[.2,.78,1],magenta:[1,.28,.74],yellow:[1,.86,.22]};
+
+/* ---------- genome: the seed behaves like DNA ---------- */
+function buildGenome(seed,family){
+  const R=makeRng("PETALS|"+seed);
+  const fam=family>=0&&family<ARCH.length;
+  const ai0=Math.floor(R()*ARCH.length), ai=fam?family:ai0; let aj=Math.floor(R()*(ARCH.length-1)); if(aj>=ai)aj++;
+  const t0=R.range(0,.42), t=fam?t0*.3:t0, A=ARCH[ai], B=ARCH[aj], G={};
+  for(const k in A) if(typeof A[k]==="number") G[k]=lerp(A[k],B[k],t);
+  G.arch=[A.name,B.name,t];
+  const pr=R(), pj=Math.floor(R()*PAL.length), pi=(fam?pr<.92:pr<.8)?ai:pj, P=PAL[pi], hs=R.range(-14,14);
+  const cp=k=>hueRot(hex(P[k]),hs);
+  G.pal={bgA:cp("bgA"),bgB:cp("bgB"),root:cp("root"),mid:cp("mid"),tip:cp("tip"),accent:cp("accent"),stem:cp("stem"),glow:cp("glow")};
+  const dl=Math.hypot(P.dir[0],P.dir[1]); G.bgDir=[P.dir[0]/dl,P.dir[1]/dl];
+  G.hueArc=R.range(18,64)*R.sign();
+  G.dayAmp=R.range(.55,1);
+  const sAng=Math.PI/2*R.sign()+R.range(-.3,.3); G.smearDir=[Math.cos(sAng),Math.sin(sAng)];
+  if(G.droop>.5) G.smearDir=[R.range(-.15,.15),-1];
+  const ph=()=>[R()*6.283,R()*6.283,R()*6.283,R()*6.283];
+
+  // flowers
+  const nF=clamp(Math.round(R.range(G.fMin-.49,G.fMax+.49)),1,6);
+  const mainL=(.17+.2*G.macro)*R.range(.88,1.14);
+  const main={x:ASPECT/2+R.range(-.16,.16), y:R.range(.5,.64)-(nF>1&&G.stack>.5?-.08:0)};
+  G.flowers=[];
+  let spine=null;
+  if(G.spike>.5){
+    const bx=ASPECT*R.range(.46,.64), by=-.04, tx=bx-R.range(.1,.26), ty=R.range(.84,.97);
+    const len=Math.hypot(tx-bx,ty-by), ang=Math.atan2(ty-by,tx-bx), bend=R.range(-.13,.02);
+    spine={bx,by,bend,at:s=>[bx+s*len*Math.cos(ang)-bend*s*s*len*Math.sin(ang),by+s*len*Math.sin(ang)+bend*s*s*len*Math.cos(ang)]};
+  }
+  for(let k=0;k<nF;k++){
+    let x,y,L,sk=0,sgn=k%2?1:-1;
+    if(spine){
+      sk=k===0?1:1-k*(.6/Math.max(1,nF-1))+R.range(-.04,.04);
+      const q=spine.at(sk); x=q[0]+(k?sgn*R.range(.015,.04):0); y=q[1]+(k?R.range(-.02,.02):0);
+      L=mainL*R.range(.78,1.08)*(k===0?.85:1);
+    }
+    else if(k===0){x=main.x;y=main.y;L=mainL;}
+    else if(R()<G.stack*.8&&k===1){x=main.x+R.range(-.07,.07);y=main.y-R.range(.26,.34);L=mainL*R.range(.85,1.05);}
+    else{
+      const a=Math.PI/2+R.range(-1.5,1.5)+(k%2?.4:-.4), d=R.range(.16,.3)*lerp(1,.7,G.cluster);
+      x=main.x+Math.cos(a)*d*1.05; y=main.y+Math.sin(a)*d*.9-(G.cluster>.5?R.range(0,.12):0);
+      L=mainL*R.range(.55,.88);
+    }
+    const n=R.int(Math.round(G.pMin),Math.round(G.pMax));
+    const face=spine?Math.PI/2+sgn*R.range(.35,.8):Math.PI/2+R.range(-.45,.45)+(G.droop>.5?R.range(-.6,.6):0);
+    const petals=[];
+    const lv=spine?[.6,1.35]:[.78,1.18];
+    for(let i=0;i<n;i++) petals.push({jit:R.range(-.18,.18)*(spine?1.8:1),lenMul:R.range(lv[0],lv[1]),widMul:R.range(.78,1.2),bendMul:R.range(.4,1.3),h:R()*97,ph:ph(),ph2:ph(),ph3:ph(),front:R()<.3});
+    const colMix=R(), tipMix=R();
+    G.flowers.push({x,y,L,n,face,petals,ph:ph(),ph2:ph(),
+      birth:k===0?0:spine?clamp((sk-.36)*.55,.02,.36):R.range(.03,.42), fade:R.range(.8,1.15), attach:spine?sk:R.range(.32,.78),
+      stemBend:spine&&k===0?spine.bend:R.range(-.12,.12)+(G.fibre>.8?R.sign()*.18:0), core:G.core>.5&&(k===0||R()<.6),
+      c0:mixc(G.pal.root,G.pal.mid,k===0?0:colMix*.4),
+      c1:spine?(k===1?G.pal.mid:mixc(G.pal.mid,G.pal.tip,R.range(.25,.6))):k%2?mixc(G.pal.mid,G.pal.accent,colMix*.6):G.pal.mid,
+      c2:mixc(G.pal.tip,G.pal.glow,tipMix*.5), hueOff:R.range(-10,10), h:R()*50});
+  }
+  G.base=spine?{x:spine.bx,y:spine.by}:{x:main.x+R.range(-.07,.07),y:-.05};
+  if(spine){G.smearDir=[R.range(-.25,-.05),-1];const l=Math.hypot(...G.smearDir);G.smearDir=G.smearDir.map(v=>v/l);}
+  // long memory: fixed per organism so it stays continuous through time
+  G.mem=[365,1460,3650].map((d,i)=>({days:d,dx:R.range(-.03,.03)+G.smearDir[0]*.03*(i+1),dy:G.smearDir[1]*R.range(.02,.045)*(i+1),
+    rot:R.range(-.07,.07),scale:R.range(1.02,1.1),tint:[TINT.cyan,TINT.magenta,G.pal.glow][i]}));
+  G.focus=spine?[(G.flowers[0].x*.4+G.flowers[Math.min(2,nF-1)].x*.6)/ASPECT,(G.flowers[0].y*.4+G.flowers[Math.min(2,nF-1)].y*.6)]:[main.x/ASPECT, main.y];
+  G.seedF=(cyrb128(seed)[0]%1000)/100;
+  return G;
+}
+
+/* ---------- time: daily rhythms + life-stage envelope ---------- */
+const PER=[1.618,3.71,9.13,27.3], AMP=[.34,.3,.22,.14];
+const rh=(p,age,G)=>{let s=0;for(let j=0;j<4;j++)s+=AMP[j]*Math.sin(6.2832*age/PER[j]+p[j]);return s*G.dayAmp;};
+
+function life(age){
+  const L=(age-1)/(MAX_DAY-1), youth=1-smooth(0,.42,L), late=smooth(.58,1,L);
+  return{L,youth,late,scale:.84+.18*smooth(0,.45,L)-.04*late,width:lerp(1,.55,youth)*(1+.08*late),
+    open:lerp(1,.32,youth)*(1-.2*late),bend:1+.9*youth+.5*late,fold:late,opac:lerp(1,.74,youth)*(1-.12*late),
+    diss:.55*late,mem:.12+.88*smooth(.25,1,L),height:lerp(.66,1,smooth(0,.38,L))};
+}
+
+/* ---------- instance packing (32 floats) ---------- */
+const FL=36, MAX_INST=2400;
+const inst=new Float32Array(MAX_INST*FL); let nInst=0;
+function push(o){ if(nInst>=MAX_INST) return; const b=nInst*FL, a=inst;
+  a[b]=o.x;a[b+1]=o.y;a[b+2]=o.ang;a[b+3]=o.len;
+  a[b+4]=o.w;a[b+5]=o.bend;a[b+6]=o.ruf;a[b+7]=o.h;
+  a[b+8]=o.c0[0];a[b+9]=o.c0[1];a[b+10]=o.c0[2];a[b+11]=o.dens;
+  a[b+12]=o.c1[0];a[b+13]=o.c1[1];a[b+14]=o.c1[2];a[b+15]=o.kind;
+  a[b+16]=o.c2[0];a[b+17]=o.c2[1];a[b+18]=o.c2[2];a[b+19]=o.soft;
+  a[b+20]=o.fibre;a[b+21]=o.vein;a[b+22]=o.diss;a[b+23]=o.ink;
+  a[b+24]=o.tint[0];a[b+25]=o.tint[1];a[b+26]=o.tint[2];a[b+27]=o.tintAmt;
+  a[b+28]=o.ph;a[b+29]=o.sa;a[b+30]=o.sb;a[b+31]=o.fold;
+  a[b+32]=o.stripe||0;a[b+33]=o.silk||0;a[b+34]=o.rf||5.5;a[b+35]=o.edgePale||0; nInst++; }
+
+function emitOrganism(G,age,S,T){
+  // S: sample transform {dx,dy,rot,scale,weight,tint,tintAmt,diss}
+  const E=life(age), pv=[G.flowers[0].x,G.flowers[0].y];
+  const cr=Math.cos(S.rot), sr=Math.sin(S.rot);
+  const X=(x,y)=>{const u=(x-pv[0])*S.scale,v=(y-pv[1])*S.scale;return[pv[0]+u*cr-v*sr+S.dx,pv[1]+u*sr+v*cr+S.dy];};
+  const hue=G.hueArc*(E.L-.5);
+  const fibre=clamp01(G.fibre*T.fibre), vein=clamp01(G.vein*T.vein), ink=clamp01(G.ink*T.ink);
+  const diss=clamp01(G.dissolve*T.dissolve+E.diss+S.diss);
+  const tAmt=clamp01(S.tintAmt*T.chroma);
+  const base=[G.base.x+.004*rh(G.flowers[0].ph,age,G),G.base.y];
+
+  // resolve anchors (young organisms are shorter; flowers sway daily)
+  const anchors=G.flowers.map(f=>{
+    const sw=.012*rh(f.ph,age,G);
+    return[base[0]+(f.x-base[0]+sw)*lerp(.9,1,E.height),base[1]+(f.y-base[1])*E.height];});
+
+  // main stem geometry, used for branching
+  const m0=anchors[0], mdx=m0[0]-base[0], mdy=m0[1]-base[1], mLen=Math.hypot(mdx,mdy), mAng=Math.atan2(mdy,mdx);
+  const mBend=G.flowers[0].stemBend;
+  const onMain=s=>{const lx=s*mLen, ly=mBend*s*s*mLen;return[base[0]+lx*Math.cos(mAng)-ly*Math.sin(mAng),base[1]+lx*Math.sin(mAng)+ly*Math.cos(mAng)];};
+
+  G.flowers.forEach((f,k)=>{
+    const g=k===0?lerp(.34,1,smooth(0,.2,E.L)):smooth(f.birth,f.birth+.12,E.L); if(g<.01) return;
+    const vis=1-.6*smooth(f.fade,f.fade+.15,E.L);
+    const dens=G.dens*E.opac*vis*S.weight*(.35+.65*g);
+    if(dens<.004) return;
+    const an=anchors[k];
+    // stem
+    const st=k===0?base:onMain(f.attach);
+    const A=X(an[0],an[1]), B=X(st[0],st[1]);
+    const sl=Math.hypot(A[0]-B[0],A[1]-B[1]);
+    if(sl>.01) push({x:B[0],y:B[1],ang:Math.atan2(A[1]-B[1],A[0]-B[0])+0,len:sl,w:(.0042*G.stemW*E.scale)/sl,bend:f.stemBend+.03*rh(f.ph2,age,G),
+      ruf:.1,h:f.h+3,c0:hueRot(G.pal.stem,hue),dens:dens*.8,c1:hueRot(mixc(G.pal.stem,f.c1,.35),hue),kind:1,c2:hueRot(mixc(G.pal.stem,f.c2,.4),hue),
+      soft:.4+diss,fibre:Math.max(fibre,.35),vein:0,diss:diss*.7,ink:ink*.6,tint:S.tint,tintAmt:tAmt,ph:age*.21,sa:.5,sb:.5,fold:0});
+    // petals
+    const face=f.face+.13*rh(f.ph,age,G)-E.late*.55*(G.droop+.35)*(Math.cos(f.face)>=0?1:-1)+S.rot;
+    const spread=Math.min(6.28,G.spread*E.open*(1+.14*rh(f.ph2,age,G))*Math.sqrt(g));
+    const c0=hueRot(f.c0,hue+f.hueOff), c1=hueRot(f.c1,hue+f.hueOff), c2=hueRot(f.c2,hue+f.hueOff);
+    const n=f.petals.length;
+    f.petals.forEach((p,i)=>{
+      const tt=(i+.5)/n-.5;
+      const ang=face+tt*spread+p.jit+.08*rh(p.ph,age,G);
+      const len=f.L*p.lenMul*E.scale*g*S.scale*(1+.06*rh(p.ph2,age,G));
+      const w=G.width*p.widMul*E.width*(1+.1*rh(p.ph3,age,G));
+      const side=tt===0?1:Math.sign(tt);
+      const bend=side*G.bend*p.bendMul*E.bend+.05*rh(p.ph3,age,G);
+      const kind=G.bract>.5?2:0;
+      push({x:A[0],y:A[1],ang,len,w,bend,ruf:G.ruffle*(1+.3*E.late),h:p.h+f.h,c0,dens:dens*(p.front?1.15:1),c1,kind,c2,
+        soft:.3+diss*.8,fibre,vein,diss,ink,tint:S.tint,tintAmt:tAmt,ph:age*.37+p.h,sa:G.sa,sb:kind===2?Math.max(G.sb,.8):G.sb,fold:E.fold,
+        stripe:G.stripe,silk:G.silk,rf:G.rf,edgePale:G.edgePale});
+    });
+    if(f.core){
+      push({x:A[0],y:A[1],ang:face,len:f.L*.13*E.scale*g*S.scale,w:1,bend:0,ruf:0,h:f.h+7,c0:hueRot(G.pal.root,hue*.5),dens:Math.min(1,dens*1.4),
+        c1:G.pal.root,kind:3,c2:hueRot(mixc(G.pal.root,G.pal.mid,.5),hue*.5),soft:0,fibre:1,vein:0,diss:diss*.5,ink:0,tint:S.tint,tintAmt:tAmt*.5,ph:age*.5,sa:0,sb:0,fold:0});
+    }
+  });
+}
+
+function buildScene(G,age,T){
+  nInst=0; const E=life(age);
+  const ex=clamp01(G.smear*T.exposure), none=[1,1,1];
+  const sd=G.smearDir, dist=o=>(.055+.06*G.dissolve)*ex*Math.pow(o,.55);
+  const S=[];
+  S.push({age,dx:0,dy:0,rot:0,scale:1,weight:1,tint:none,tintAmt:0,diss:0});
+  [[.9,.34,TINT.cyan],[2.4,.2,G.chroma>.5?TINT.magenta:G.pal.glow]].forEach(([o,w,tc])=>{
+    if(age-o<1) return;
+    S.push({age:age-o,dx:sd[0]*dist(o),dy:sd[1]*dist(o),rot:.018*o*(G.hueArc>0?1:-1),scale:1+.012*o,weight:w*ex,tint:tc,tintAmt:G.chroma*.75,diss:(.12+.2*G.dissolve)*o});
+  });
+  if(G.chroma*T.chroma>.25&&age+.8<=MAX_DAY) S.push({age:age+.8,dx:-sd[0]*dist(.8),dy:-sd[1]*dist(.8),rot:0,scale:1,weight:.35*G.chroma,tint:TINT.yellow,tintAmt:G.chroma*.8,diss:.1});
+  const mw=E.mem*G.memory*T.memory;
+  G.mem.forEach((m,i)=>{
+    if(age-m.days<1||mw<.02) return;
+    const w=mw*[.34,.24,.16][i];
+    S.push({age:age-m.days,dx:m.dx,dy:m.dy,rot:m.rot,scale:m.scale,weight:w,tint:m.tint,tintAmt:clamp01(G.chroma*.8+.2),diss:.3+.15*i});
+  });
+  S.forEach(s=>emitOrganism(G,s.age,s,T));
+  return nInst;
+}
+
+/* ============================================================
+   GPU
+   ============================================================ */
+const NOISE=`
+float h11(float n){return fract(sin(n*127.1+.73)*43758.5453);}
+float h21(vec2 p){vec3 q=fract(vec3(p.xyx)*.1031);q+=dot(q,q.yzx+33.33);return fract((q.x+q.y)*q.z);}
+float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);}
+float fbm(vec2 p){float s=0.,a=.5;for(int i=0;i<4;i++){s+=a*vnoise(p);p=p*2.03+17.1;a*=.5;}return s/.9375;}
+float fbm2(vec2 p){return (vnoise(p)*.66+vnoise(p*2.1+5.2)*.34);}
+`;
+const VS_PETAL=`#version 300 es
+layout(location=0) in vec2 aC;
+layout(location=1) in vec4 a0;layout(location=2) in vec4 a1;layout(location=3) in vec4 a2;layout(location=4) in vec4 a3;
+layout(location=5) in vec4 a4;layout(location=6) in vec4 a5;layout(location=7) in vec4 a6;layout(location=8) in vec4 a7;layout(location=9) in vec4 a8;
+uniform float uAspect;
+out vec2 vP; flat out vec4 v1,v2,v3,v4,v5,v6,v7,v8;
+void main(){
+  vec2 p;
+  if(a3.w>2.5){ p=mix(vec2(-1.25),vec2(1.25),aC); }
+  else{ float W=a1.x,b=a1.y; float pad=W*(1.45+a1.z*.5)+.05+a5.z*.3*W;
+        p=vec2(mix(-.12,1.12,aC.x),mix(min(0.,b)-pad,max(0.,b)+pad,aC.y)); }
+  float c=cos(a0.z),s=sin(a0.z);
+  vec2 w=a0.xy+a0.w*vec2(c*p.x-s*p.y,s*p.x+c*p.y);
+  gl_Position=vec4(w.x/uAspect*2.-1.,w.y*2.-1.,0.,1.);
+  vP=p;v1=a1;v2=a2;v3=a3;v4=a4;v5=a5;v6=a6;v7=a7;v8=a8;
+}`;
+const FS_PETAL=`#version 300 es
+precision highp float;
+in vec2 vP; flat in vec4 v1,v2,v3,v4,v5,v6,v7,v8;
+uniform float uEnc;
+layout(location=0) out vec4 o0; layout(location=1) out vec4 o1; layout(location=2) out vec4 o2;
+${NOISE}
+float patchyPre(float s,float side,float h){return pow(vnoise(vec2(s*3.2+h*7.,side*2.3+h)),2.2)*1.6;}
+float cellEdge(vec2 p){vec2 i=floor(p),f=fract(p);float d1=8.,d2=8.;
+ for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 g=vec2(x,y);vec2 o=vec2(h21(i+g),h21(i+g+19.7));vec2 r=g+o-f;float d=dot(r,r);
+ if(d<d1){d2=d1;d1=d;}else if(d<d2)d2=d;} return sqrt(d2)-sqrt(d1);}
+void main(){
+  float kind=v3.w,h=v1.w;
+  vec3 c0=v2.rgb,c1=v3.rgb,c2=v4.rgb; float dens0=v2.w,soft0=v4.w;
+  float fibre=v5.x,vein=v5.y,diss=v5.z,ink=v5.w;
+  float ph=v7.x,sa=v7.y,sb=v7.z,fold=v7.w;
+  float a=0.; vec3 col;
+  if(kind>2.5){
+    /* flower core: radial filaments + anthers */
+    float r=length(vP),an=atan(vP.y,vP.x);
+    float N=72.,u=(an/6.2831853+.5)*N,fi=floor(u),fh=h11(fi+h*31.);
+    float rend=mix(.5,1.,fh)*(1.+.08*sin(ph+fi));
+    float aa=fwidth(u);
+    float line=1.-smoothstep(.12-aa,.12+aa+.2,abs(fract(u)-.5));
+    float fil=line*smoothstep(rend+.02,rend-.12,r)*smoothstep(.12,.4,r);
+    float anther=smoothstep(.09,.03,abs(r-rend))*line;
+    float disc=smoothstep(.4,.16,r*(1.+.35*(vnoise(vec2(an*2.5,h))-.5)));
+    float soft=smoothstep(1.25,.3,r);
+    float d=max(disc*.95,max(fil*.75,anther))*soft;
+    d=mix(d,smoothstep(1.,0.,r)*.7,diss);
+    a=clamp(d*dens0,0.,.97);
+    col=mix(c0,c2,smoothstep(.15,.9,r));
+    col=mix(col,c0*.85,anther*.6);
+  } else {
+    float s=vP.x,q=vP.y,W=v1.x,bend=v1.y,ruf=v1.z;
+    float n=q-bend*s*s;
+    float sc=clamp(s,0.,1.);
+    float prof;
+    bool stem=kind>.5&&kind<1.5;
+    if(stem){ prof=(1.-.45*sc)*smoothstep(-.02,.03,s)*smoothstep(1.02,.95,s); }
+    else { float pa=pow(sc,sa)*pow(1.-sc,sb); float pm=pow(sa/(sa+sb),sa)*pow(sb/(sa+sb),sb); prof=pa/pm; }
+    float side=n>0.?1.:-1.;
+    float rf=v8.z;
+    float wav=(fbm(vec2(s*rf+ph*.35,side*4.3+h*9.))-.5)*2.+(vnoise(vec2(s*rf*1.7+ph*.2,side*3.1+h))-.5)*.45*step(7.,rf);
+    prof*=1.+ruf*wav*smoothstep(.2,1.,s);
+    prof*=1.-.32*fold*smoothstep(.45,.95,s);
+    float wv=max(W*prof,1e-4);
+    float v=n/wv;
+    float inside=1.-abs(v);
+    inside+=(fbm(vec2(s*6.,v*1.8)+h*5.)-.5)*.3*diss*patchyPre(s,side,h);
+    float sn=vnoise(vec2(s*3.2+h*7.,side*2.3+h));
+    float patchy=pow(sn,2.2);
+    float soft=mix(.012,.5,clamp(.03+soft0*.05+diss*.85*patchy,0.,1.));
+    soft=max(soft,fwidth(inside)*1.2);
+    float mask=smoothstep(-soft*.4,soft,inside);
+    mask*=smoothstep(-.04,.06,s)*smoothstep(1.02,.95-.25*diss*patchy,s);
+    /* density field */
+    float root=1.-sc;
+    float d=stem?.8:(.52+.48*pow(root,1.2));
+    d*=.7+.6*fbm(vec2(s*2.4,v*1.6)+h*3.1);
+    d*=mix(.72,1.,smoothstep(0.,.45,inside));
+    d+=(1.-diss)*(1.-ink)*.45*exp(-max(inside,0.)*16.)*smoothstep(-.05,.08,inside)*(stem?0.:1.);
+    d+=ink*1.7*exp(-max(inside,0.)*6.5)*smoothstep(-.15,.25,inside);
+    d+=ink*.9*smoothstep(.55,.05,s)*smoothstep(.25,.85,inside);
+    /* fibre field */
+    float warp=(fbm(vec2(s*1.5+h,v*1.1))-.5)*.55;
+    float u=(v*.5+.5)+warp*s*.55;
+    float N=stem?mix(5.,26.,fibre):mix(26.,250.,fibre);
+    float uu=u*N,fi=floor(uu),fh=h11(fi*1.31+h*7.7);
+    float aa=fwidth(uu);
+    float th=mix(.1,.42,fh);
+    float line=1.-smoothstep(th*.5-aa,th*.5+aa,abs(fract(uu)-.5));
+    line=mix(line,th,smoothstep(.35,.9,aa));
+    float flen=mix(.72,1.12,h11(fi*2.17+h));
+    line*=smoothstep(flen,flen-.25,s)*(.35+.65*fh);
+    d*=mix(1.,.16+1.95*line,fibre);
+    d+=fibre*.55*exp(-abs(inside-.03)*55.)*mask*(1.-diss);
+    /* veins */
+    float vn=0.;
+    if(vein>.001){
+      float mid=exp(-abs(n)/max(W,1e-3)*38.)*(1.-sc*.6);
+      float lat=abs(fract(s*6.5-abs(v)*1.5+h)-.5);
+      float latL=(1.-smoothstep(.015,.055,lat))*smoothstep(.95,.25,abs(v))*(1.-sc*.5);
+      float net=1.-smoothstep(0.,.08,cellEdge(vec2(s*15.,v*8.)+h*13.));
+      vn=max(mid,max(latL*.8,net*(kind>1.5?.55:.25)));
+      d+=vein*vn*.85;
+    }
+    /* late-life fold */
+    d+=exp(-abs(s-(.55+.12*sin(v*2.5+h*6.)))*22.)*fold*.45;
+    /* pigment field */
+    col=mix(c0,c1,smoothstep(.04,.55,s));
+    col=mix(col,c2,smoothstep(.42,1.,s));
+    col=mix(col,c1,.4*(fbm(vec2(s*1.8,v*1.3)+h*2.)-.35));
+    col*=mix(1.,.8,vein*vn);
+    /* silk striations, throat streaks, centre stripe, pale translucent rims */
+    float silk=v8.y,stripe=v8.x,pale=v8.w;
+    if(silk>0.){
+      float st=vnoise(vec2(u*34.,s*1.6+h));
+      d*=1.+silk*.35*(st-.5);
+      col=mix(col,c0,silk*.45*smoothstep(.55,.95,vnoise(vec2(u*22.+h,s*1.2)))*smoothstep(.75,.1,s));
+    }
+    if(stripe>0.){
+      float sm=exp(-v*v*5.)*smoothstep(.04,.3,s)*smoothstep(1.,.55,s)*(.6+.8*vnoise(vec2(s*3.+h,v*2.)));
+      col=mix(col,clamp(c1*vec3(.95,.6,.88),0.,1.),stripe*.55*clamp(sm,0.,1.)*smoothstep(.2,.5,s));
+      d+=stripe*.25*sm;
+    }
+    if(pale>0.){ col=mix(col,mix(c2,vec3(1.,.97,.98),.35),pale*smoothstep(.45,.98,abs(v))*smoothstep(.15,.6,s)); d*=1.-pale*.35*smoothstep(.6,1.,abs(v)); }
+    col=mix(col,c0*c0*.7,ink*smoothstep(.9,1.8,d));
+    a=clamp(mask*d*dens0,0.,.97);
+  }
+  col=mix(col,v6.rgb*(.55+.45*dot(col,vec3(.333))),v6.w*.3);
+  col=clamp(col,0.,1.);
+  vec3 ab=-log(clamp(col,.035,1.));
+  float k=1.-.85*v6.w;
+  o0=vec4(col*a,a)*k*uEnc;
+  o1=vec4(ab*a,-log(1.-a*k))*uEnc;
+  o2=vec4(v6.rgb*a,a)*v6.w*uEnc;
+}`;
+const VS_FULL=`#version 300 es
+layout(location=0) in vec2 aP; out vec2 vUv;
+void main(){vUv=aP*.5+.5;gl_Position=vec4(aP,0.,1.);}`;
+const FS_SMEAR=`#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uT0,uT1,uT2; uniform vec2 uDir; uniform float uLen,uDiff,uMix,uSeed,uBottom;
+layout(location=0) out vec4 o0; layout(location=1) out vec4 o1; layout(location=2) out vec4 o2;
+${NOISE}
+void main(){
+  vec2 uv=vUv;
+  float m=smoothstep(.38,.72,fbm(uv*vec2(2.1,1.2)+uSeed));
+  m=max(m,smoothstep(.5,.02,uv.y)*uBottom*(.55+.45*vnoise(vec2(uv.x*14.,uSeed))));
+  vec2 fl=vec2(fbm(uv*3.4+uSeed*1.3),fbm(uv*3.4+vec2(9.3,2.1)+uSeed))-.5;
+  vec2 fl2=vec2(vnoise(uv*9.+uSeed),vnoise(uv*9.+4.4+uSeed))-.5;
+  vec4 a0=vec4(0),a1=vec4(0),a2=vec4(0); float ws=0.;
+  for(int i=0;i<30;i++){
+    float t=float(i)/29.*1.25-.25;
+    vec2 o=uDir*uLen*m*t+(fl*uDiff+fl2*uDiff*.35)*abs(t)*(1.+t);
+    float w=exp(-abs(t)*2.)*(t<0.?.6:1.);
+    a0+=texture(uT0,uv+o)*w; a1+=texture(uT1,uv+o)*w; a2+=texture(uT2,uv+o*1.35)*w; ws+=w;
+  }
+  a0/=ws;a1/=ws;a2/=ws;
+  float k=clamp(uMix*m,0.,.95);
+  o0=mix(texture(uT0,uv),a0,k*.4); o1=mix(texture(uT1,uv),a1,k*.4); o2=mix(texture(uT2,uv),a2,min(1.,k*1.6));
+}`;
+const FS_BLUR=`#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uT0,uT1,uT2; uniform vec2 uStep;
+layout(location=0) out vec4 o0; layout(location=1) out vec4 o1; layout(location=2) out vec4 o2;
+void main(){
+  float w[5]=float[](.2270270,.1945946,.1216216,.0540540,.0162162);
+  vec4 a=texture(uT0,vUv)*w[0],b=texture(uT1,vUv)*w[0],c=texture(uT2,vUv)*w[0];
+  for(int i=1;i<5;i++){vec2 o=uStep*float(i);
+    a+=(texture(uT0,vUv+o)+texture(uT0,vUv-o))*w[i]; b+=(texture(uT1,vUv+o)+texture(uT1,vUv-o))*w[i]; c+=(texture(uT2,vUv+o)+texture(uT2,vUv-o))*w[i];}
+  o0=a;o1=b;o2=c;
+}`;
+const FS_COMP=`#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 frag;
+uniform sampler2D uS0,uS1,uS2,uB0,uB1,uB2,uC0,uC1;
+uniform vec3 uBgA,uBgB; uniform vec2 uBgDir,uFocus,uCADir; uniform float uBlur,uCA,uGrain,uSeed,uOverlap,uBloom,uDec;
+${NOISE}
+vec3 bgAt(vec2 uv){float t=clamp(dot(uv-.5,uBgDir)*1.1+.5,0.,1.);vec3 c=mix(uBgB,uBgA,smoothstep(0.,1.,t));
+  return c*(1.+(fbm(uv*vec2(2.5,3.3)+uSeed)-.5)*.045);}
+float focusM(vec2 uv){float d=length((uv-uFocus)*vec2(.75,1.));
+  float n=fbm(uv*2.4+uSeed*2.);
+  return clamp(smoothstep(.22,.55,d+(n-.5)*.35)*uBlur,0.,.9);}
+vec3 shade(vec2 uv){
+  float fm=focusM(uv);
+  vec4 t0=mix(texture(uS0,uv),texture(uB0,uv),fm)*uDec, t1=mix(texture(uS1,uv),texture(uB1,uv),fm)*uDec;
+  vec3 bg=bgAt(uv);
+  float reveal=exp(-t1.a*1.35);
+  vec3 avg=t0.rgb/max(t0.a,1e-4);
+  avg=clamp(mix(vec3(dot(avg,vec3(.3,.55,.15))),avg,1.18),0.,1.);
+  vec3 c=mix(bg,avg,1.-reveal);
+  float ov=smoothstep(.7,2.2,t0.a);
+  c*=exp(-t1.rgb/max(t0.a,1e-4)*ov*uOverlap*.5);
+  vec4 g0=texture(uC0,uv)*uDec, g1=texture(uC1,uv)*uDec;
+  vec3 gavg=g0.rgb/max(g0.a,1e-4); float gcov=1.-exp(-g1.a);
+  vec3 glow=gavg*gcov*uBloom;
+  c=1.-(1.-c)*(1.-glow*.4);
+  vec4 t2=mix(texture(uS2,uv),texture(uB2,uv),fm*.7)*uDec;
+  float gc=1.-exp(-t2.a*1.6); vec3 gcol=t2.rgb/max(t2.a,1e-4);
+  vec3 scr=1.-(1.-c)*(1.-gcol*gc*.75);
+  vec3 mul=c*mix(vec3(1.),gcol,gc*.55);
+  c=mix(scr,mul,smoothstep(.55,.85,dot(c,vec3(.3,.5,.2))));
+  return c;
+}
+void main(){
+  vec2 uv=vUv; vec2 o=uCADir*uCA;
+  vec3 c=vec3(shade(uv+o).r,shade(uv).g,shade(uv-o).b);
+  float r=length((uv-.5)*vec2(.75,1.));
+  c*=mix(1.,.94,smoothstep(.35,.75,r));
+  c+=(h21(gl_FragCoord.xy+uSeed*31.)-.5)*uGrain;
+  frag=vec4(clamp(c,0.,1.),1.);
+}`;
+
+const cv=document.getElementById("cv");
+const gl=cv.getContext("webgl2",{antialias:false,premultipliedAlpha:false,preserveDrawingBuffer:true});
+let GPU=null;
+function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;}
+function prog(vs,fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));
+  const u={};const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);for(let i=0;i<n;i++){const nm=gl.getActiveUniform(p,i).name;u[nm]=gl.getUniformLocation(p,nm);}return{p,u};}
+function initGPU(){
+  const fl=!!gl.getExtension("EXT_color_buffer_float");
+  const fmt=fl?{i:gl.RGBA16F,t:gl.HALF_FLOAT}:{i:gl.RGBA8,t:gl.UNSIGNED_BYTE};
+  const target=(w,h)=>{const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);const tex=[];
+    for(let i=0;i<3;i++){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+      gl.texImage2D(gl.TEXTURE_2D,0,fmt.i,w,h,0,gl.RGBA,fmt.t,null);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,t,0);tex.push(t);}
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1,gl.COLOR_ATTACHMENT2]);
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw new Error("Framebuffer incomplete");
+    return{fb,tex,w,h};};
+  const hw=RES_W>>1,hh=RES_H>>1,qw=RES_W>>2,qh=RES_H>>2;
+  const G={float:fl,enc:fl?1:.25,
+    scene:target(RES_W,RES_H),smear:target(RES_W,RES_H),h1:target(hw,hh),h2:target(hw,hh),q1:target(qw,qh),q2:target(qw,qh),
+    petal:prog(VS_PETAL,FS_PETAL),smearP:prog(VS_FULL,FS_SMEAR),blur:prog(VS_FULL,FS_BLUR),comp:prog(VS_FULL,FS_COMP)};
+  // petal VAO
+  G.vao=gl.createVertexArray();gl.bindVertexArray(G.vao);
+  const cb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,cb);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([0,0,1,0,0,1,1,1]),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  G.ib=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,G.ib);gl.bufferData(gl.ARRAY_BUFFER,inst.byteLength,gl.DYNAMIC_DRAW);
+  for(let i=0;i<9;i++){gl.enableVertexAttribArray(1+i);gl.vertexAttribPointer(1+i,4,gl.FLOAT,false,FL*4,i*16);gl.vertexAttribDivisor(1+i,1);}
+  // fullscreen VAO
+  G.fvao=gl.createVertexArray();gl.bindVertexArray(G.fvao);
+  const fb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,fb);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  gl.bindVertexArray(null);
+  return G;
+}
+function pass(P,dst,tex,setU){
+  gl.useProgram(P.p);
+  if(dst){gl.bindFramebuffer(gl.FRAMEBUFFER,dst.fb);gl.viewport(0,0,dst.w,dst.h);}
+  else{gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,RES_W,RES_H);}
+  tex.forEach(([name,t],i)=>{gl.activeTexture(gl.TEXTURE0+i);gl.bindTexture(gl.TEXTURE_2D,t);gl.uniform1i(P.u[name],i);});
+  setU&&setU(P.u);
+  gl.bindVertexArray(GPU.fvao);gl.drawArrays(gl.TRIANGLES,0,3);
+}
+function blurChain(src,a,b,px){ // separable blur src -> a (h) -> b (v)
+  pass(GPU.blur,a,[["uT0",src.tex[0]],["uT1",src.tex[1]],["uT2",src.tex[2]]],u=>gl.uniform2f(u.uStep,px/a.w,0));
+  pass(GPU.blur,b,[["uT0",a.tex[0]],["uT1",a.tex[1]],["uT2",a.tex[2]]],u=>gl.uniform2f(u.uStep,0,px/a.h));
+}
+function renderGPU(G,age,T){
+  const n=buildScene(G,age,T);
+  gl.disable(gl.DEPTH_TEST);
+  // 1. material field accumulation (order-independent)
+  gl.bindFramebuffer(gl.FRAMEBUFFER,GPU.scene.fb);gl.viewport(0,0,RES_W,RES_H);
+  gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE);
+  gl.useProgram(GPU.petal.p);gl.uniform1f(GPU.petal.u.uAspect,ASPECT);gl.uniform1f(GPU.petal.u.uEnc,GPU.enc);
+  gl.bindVertexArray(GPU.vao);gl.bindBuffer(gl.ARRAY_BUFFER,GPU.ib);gl.bufferSubData(gl.ARRAY_BUFFER,0,inst,0,n*FL);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,n);
+  gl.disable(gl.BLEND);
+  // 2. temporal smear + pigment diffusion
+  const d=G.smearDir, dl=Math.hypot(d[0]/ASPECT,d[1]);
+  pass(GPU.smearP,GPU.smear,[["uT0",GPU.scene.tex[0]],["uT1",GPU.scene.tex[1]],["uT2",GPU.scene.tex[2]]],u=>{
+    gl.uniform2f(u.uDir,d[0]/ASPECT/dl,d[1]/dl);gl.uniform1f(u.uLen,.14*G.smear*T.exposure);
+    gl.uniform1f(u.uDiff,.05*(G.dissolve+.3)*T.dissolve);gl.uniform1f(u.uMix,clamp01(.1+.6*G.smear*T.exposure));gl.uniform1f(u.uSeed,G.seedF);gl.uniform1f(u.uBottom,G.bottom*T.exposure);});
+  // 3. optical softness (half res) + bloom (quarter res)
+  blurChain(GPU.smear,GPU.h1,GPU.h2,2.2);
+  blurChain(GPU.h2,GPU.q1,GPU.q2,3.0);
+  // 4. composite
+  const p=G.pal;
+  pass(GPU.comp,null,[["uS0",GPU.smear.tex[0]],["uS1",GPU.smear.tex[1]],["uS2",GPU.smear.tex[2]],["uB0",GPU.h2.tex[0]],["uB1",GPU.h2.tex[1]],["uB2",GPU.h2.tex[2]],["uC0",GPU.q2.tex[0]],["uC1",GPU.q2.tex[1]]],u=>{
+    gl.uniform3fv(u.uBgA,p.bgA);gl.uniform3fv(u.uBgB,p.bgB);gl.uniform2fv(u.uBgDir,G.bgDir);gl.uniform2fv(u.uFocus,G.focus);
+    gl.uniform2f(u.uCADir,d[0]/ASPECT/dl,d[1]/dl);gl.uniform1f(u.uCA,.0035*G.chroma*T.chroma);
+    gl.uniform1f(u.uBlur,clamp01(G.blur*T.blur));gl.uniform1f(u.uGrain,.035*T.grain);gl.uniform1f(u.uSeed,G.seedF);
+    gl.uniform1f(u.uOverlap,.9);gl.uniform1f(u.uBloom,G.bloom);gl.uniform1f(u.uDec,1/GPU.enc);});
+}
+
